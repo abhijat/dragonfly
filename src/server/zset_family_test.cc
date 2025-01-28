@@ -1123,4 +1123,59 @@ TEST_F(ZSetFamilyTest, RangeStore) {
   EXPECT_THAT(resp, ArrLen(0));
 }
 
+TEST_F(ZSetFamilyTest, ZDiffStoreError) {
+  RespExpr resp;
+
+  resp = Run({"zdiffstore", "out", "-1", "z1"});
+  EXPECT_THAT(resp, ErrArg("value is not an integer or out of range"));
+
+  resp = Run({"zdiffstore", "out"});
+  EXPECT_THAT(resp, ErrArg("wrong number of arguments"));
+
+  resp = Run({"zdiffstore",
+              "out"
+              "0"});
+  EXPECT_THAT(resp, ErrArg("wrong number of arguments"));
+
+  resp = Run({"zdiffstore", "out", "0", "z1"});
+  EXPECT_THAT(resp, ErrArg("at least 1 input key is needed"));
+
+  resp = Run({"zdiffstore", "out", "zero", "z1", "z2"});
+  EXPECT_THAT(resp, ErrArg("value is not an integer or out of range"));
+
+  // Args size < supplied num keys
+  resp = Run({"zdiffstore", "out", "25", "z1", "z2"});
+  EXPECT_THAT(resp, ErrArg("syntax error"));
+}
+
+TEST_F(ZSetFamilyTest, ZDiffStore) {
+  EXPECT_EQ(3, CheckedInt({"zadd", "z1", "1", "one", "2", "two", "3", "three"}));
+  EXPECT_EQ(2, CheckedInt({"zadd", "z2", "1", "one", "2", "two"}));
+
+  EXPECT_EQ(1, CheckedInt({"zdiffstore", "out", "2", "z1", "z2"}));
+  RespExpr resp = Run({"zrange", "out", "0", "-1", "WITHSCORES"});
+  EXPECT_THAT(resp.GetVec(), ElementsAre("three", "3"));
+
+  // Non existent zsets
+  EXPECT_EQ(3, CheckedInt({"zdiffstore", "out", "2", "z1", "nothing"}));
+  resp = Run({"zrange", "out", "0", "-1"});
+  // expect that the diff is the entire z1
+  EXPECT_THAT(resp.GetVec(), ElementsAre("one", "two", "three"));
+
+  EXPECT_EQ(0, CheckedInt({"zdiffstore", "out", "2", "nothing", "z1"}));
+  resp = Run({"zrange", "out", "0", "-1"});
+  // the diff is empty because the source of comparison is missing
+  EXPECT_TRUE(resp.GetVec().empty());
+
+  // Overwrite (this has been implicitly tested before, but just for completeness)
+  EXPECT_EQ(1, CheckedInt({"zadd", "out", "100", "oneH"}));
+  resp = Run({"zrange", "out", "0", "-1", "WITHSCORES"});
+  EXPECT_THAT(resp.GetVec(), ElementsAre("oneH", "100"));
+
+  // overwrite, this time expect the full contents of z2 as xxxxxx is missing
+  EXPECT_EQ(2, CheckedInt({"zdiffstore", "out", "2", "z2", "xxxxxx"}));
+  resp = Run({"zrange", "out", "0", "-1", "WITHSCORES"});
+  EXPECT_THAT(resp.GetVec(), ElementsAre("one", "1", "two", "2"));
+}
+
 }  // namespace dfly
