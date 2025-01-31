@@ -1087,7 +1087,7 @@ void BZPopMinMax(CmdArgList args, Transaction* tx, SinkReplyBuilder* builder,
   return rb->SendNullArray();
 }
 
-vector<ScoredMap> OpFetch(EngineShard* shard, Transaction* t) {
+vector<ScoredMap> OpFetch(EngineShard* shard, Transaction* t, bool skip_first_key) {
   ShardArgs keys = t->GetShardArgs(shard->shard_id());
   DCHECK(!keys.Empty());
 
@@ -1095,14 +1095,19 @@ vector<ScoredMap> OpFetch(EngineShard* shard, Transaction* t) {
   results.reserve(keys.Size());
 
   auto& db_slice = t->GetDbSlice(shard->shard_id());
-  for (string_view key : keys) {
-    auto it = db_slice.FindReadOnly(t->GetDbContext(), key, OBJ_ZSET);
-    if (!it) {
+  auto start = keys.begin();
+  if (skip_first_key) {
+    ++start;
+  }
+
+  for (auto it = start; it != keys.end(); ++it) {
+    auto zset_it = db_slice.FindReadOnly(t->GetDbContext(), *it, OBJ_ZSET);
+    if (!zset_it) {
       results.push_back({});
       continue;
     }
 
-    ScoredMap sm = FromObject((*it)->second, 1);
+    ScoredMap sm = FromObject((*zset_it)->second, 1);
     results.push_back(std::move(sm));
   }
 
@@ -1843,6 +1848,55 @@ bool ValidateZMPopCommand(CmdArgList args, uint32* num_keys, bool* is_max, int* 
   return true;
 }
 
+// Given a set of ScoredMap object collected from all shards, and a shard id, calculcates the diff
+// between the first scored map from the given shard, against all other collected scored maps. Used
+// in zdiff family commands
+vector<ScoredMemberView> ComputeZDiff(vector<vector<ScoredMap>> scored_maps,
+                                      const ShardId shard_id) {
+  auto& sm = scored_maps[shard_id];
+  if (sm.empty()) {
+    return {};
+  }
+
+  // The scored map against which all diffs are computed is the first (or second, for zdiffstore)
+  // arg passed to the command. Since the collection process stores the scored maps in the same
+  // order as command, the first object in the given shard extracted here and then all other objects
+  // are compared to its keys. For zdiffstore we have previously removed the "out" key during the
+  // collection process.
+  auto result = std::move(sm[0]);
+  sm.erase(sm.begin());
+
+  auto filter = [&result](const auto& key) mutable {
+    if (auto it = result.find(key); it != result.end()) {
+      result.erase(it);
+    }
+  };
+
+  // Total O(L)
+  // Iterate over the results of each shard
+  for (auto& vsm : scored_maps) {
+    // Iterate over each fetched set
+    for (auto& sm : vsm) {
+      // Iterate over each key in the fetched set and filter
+      for (auto& [key, value] : sm) {
+        filter(key);
+      }
+    }
+  }
+
+  vector<ScoredMemberView> smvec;
+  smvec.reserve(result.size());
+
+  // move strings out of result as we process it
+  for_each(make_move_iterator(result.begin()), make_move_iterator(result.end()),
+           [&smvec](auto&& pair) { smvec.emplace_back(pair.second, std::move(pair.first)); });
+
+  // Total O(KlogK)
+  std::sort(std::begin(smvec), std::end(smvec));
+
+  return smvec;
+}
+
 }  // namespace
 
 void ZSetFamily::ZAddGeneric(string_view key, const ZParams& zparams, ScoredMemberSpan memb_sp,
@@ -2169,59 +2223,58 @@ void ZSetFamily::ZCount(CmdArgList args, const CommandContext& cmd_cntx) {
 void ZSetFamily::ZDiff(CmdArgList args, const CommandContext& cmd_cntx) {
   vector<vector<ScoredMap>> maps(shard_set->size());
   auto cb = [&](Transaction* t, EngineShard* shard) {
-    maps[shard->shard_id()] = OpFetch(shard, t);
+    maps[shard->shard_id()] = OpFetch(shard, t, false);
     return OpStatus::OK;
   };
 
   cmd_cntx.tx->ScheduleSingleHop(std::move(cb));
 
-  const string_view key = ArgS(args, 1);
-  const ShardId sid = Shard(key, maps.size());
-  auto* rb = static_cast<RedisReplyBuilder*>(cmd_cntx.rb);
-  // Extract the ScoredMap of the first key
-  auto& sm = maps[sid];
-  if (sm.empty()) {
+  vector<ScoredMemberView> smvec =
+      ComputeZDiff(std::move(maps), Shard(ArgS(args, 1), shard_set->size()));
+  auto* rb = dynamic_cast<RedisReplyBuilder*>(cmd_cntx.rb);
+  if (smvec.empty()) {
     rb->SendEmptyArray();
     return;
   }
-  auto result = std::move(sm[0]);
-  sm.erase(sm.begin());
-
-  auto filter = [&result](const auto& key) mutable {
-    auto it = result.find(key);
-    if (it != result.end()) {
-      result.erase(it);
-    }
-  };
-
-  // Total O(L)
-  // Iterate over the results of each shard
-  for (auto& vsm : maps) {
-    // Iterate over each fetched set
-    for (auto& sm : vsm) {
-      // Iterate over each key in the fetched set and filter
-      for (auto& [key, value] : sm) {
-        filter(key);
-      }
-    }
-  }
-
-  vector<ScoredMemberView> smvec;
-  for (const auto& elem : result) {
-    smvec.emplace_back(elem.second, elem.first);
-  }
-
-  // Total O(KlogK)
-  std::sort(std::begin(smvec), std::end(smvec));
 
   const bool with_scores = ArgS(args, args.size() - 1) == "WITHSCORES";
-  rb->StartArray(result.size() * (with_scores ? 2 : 1));
+  rb->StartArray(smvec.size() * (with_scores ? 2 : 1));
   for (const auto& [score, key] : smvec) {
     rb->SendBulkString(key);
     if (with_scores) {
       rb->SendDouble(score);
     }
   }
+}
+
+void ZSetFamily::ZDiffStore(CmdArgList args, const CommandContext& cmd_cntx) {
+  vector<vector<ScoredMap>> maps(shard_set->size());
+
+  string_view dest_key = ArgS(args, 0);
+  const ShardId dest_shard = Shard(dest_key, shard_set->size());
+
+  auto cb = [&](Transaction* t, EngineShard* shard) {
+    const bool skip_first_key = dest_shard == shard->shard_id();
+    maps[shard->shard_id()] = OpFetch(shard, t, skip_first_key);
+    return OpStatus::OK;
+  };
+
+  cmd_cntx.tx->Execute(std::move(cb), false);
+  const ShardId root_key_shard = Shard(ArgS(args, 2), shard_set->size());
+  vector<ScoredMemberView> smvec = ComputeZDiff(std::move(maps), root_key_shard);
+
+  // The following is the same logic as ZBooleanOperation when it stores data.
+  auto store_cb = [&smvec, &dest_key, dest_shard = move(dest_shard)](Transaction* t,
+                                                                     EngineShard* shard) {
+    if (shard->shard_id() == dest_shard) {
+      ZSetFamily::OpAdd(t->GetOpArgs(shard), ZSetFamily::ZParams{.override = true}, dest_key,
+                        smvec);
+    }
+    return OpStatus::OK;
+  };
+
+  cmd_cntx.tx->Execute(std::move(store_cb), true);
+  cmd_cntx.rb->SendLong(smvec.size());
 }
 
 void ZSetFamily::ZIncrBy(CmdArgList args, const CommandContext& cmd_cntx) {
@@ -2638,6 +2691,7 @@ constexpr uint32_t kBZPopMax = WRITE | SORTEDSET | FAST | BLOCKING;
 constexpr uint32_t kZCard = READ | SORTEDSET | FAST;
 constexpr uint32_t kZCount = READ | SORTEDSET | FAST;
 constexpr uint32_t kZDiff = READ | SORTEDSET | SLOW;
+constexpr uint32_t kZDiffStore = WRITE | SORTEDSET | SLOW;
 constexpr uint32_t kZIncrBy = WRITE | SORTEDSET | FAST;
 constexpr uint32_t kZInterStore = WRITE | SORTEDSET | SLOW;
 constexpr uint32_t kZInter = READ | SORTEDSET | SLOW;
@@ -2682,6 +2736,7 @@ void ZSetFamily::Register(CommandRegistry* registry) {
       << CI{"ZCARD", CO::FAST | CO::READONLY, 2, 1, 1, acl::kZCard}.HFUNC(ZCard)
       << CI{"ZCOUNT", CO::FAST | CO::READONLY, 4, 1, 1, acl::kZCount}.HFUNC(ZCount)
       << CI{"ZDIFF", CO::READONLY | CO::VARIADIC_KEYS, -3, 2, 2, acl::kZDiff}.HFUNC(ZDiff)
+      << CI{"ZDIFFSTORE", kStoreMask, -3, 3, -1, acl::kZDiffStore}.HFUNC(ZDiffStore)
       << CI{"ZINCRBY", CO::FAST | CO::WRITE, 4, 1, 1, acl::kZIncrBy}.HFUNC(ZIncrBy)
       << CI{"ZINTERSTORE", kStoreMask, -4, 3, 3, acl::kZInterStore}.HFUNC(ZInterStore)
       << CI{"ZINTER", CO::READONLY | CO::VARIADIC_KEYS, -3, 2, 2, acl::kZInter}.HFUNC(ZInter)
